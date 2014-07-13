@@ -211,8 +211,11 @@ class Downloader:
         }
         headers.update(self.REQUESTS_HEADERS)
         cookies = {"csrftoken": csrf_token}
-        data = {self.USERNAME_FIELD_NAME: self.username,
-                self.PASSWORD_FIELD_NAME: self.password}
+        data = {
+            self.USERNAME_FIELD_NAME: self.username,
+            self.PASSWORD_FIELD_NAME: self.password,
+            'webrequest': 'true'
+        }
         response = yield from _http_request(
             self.LOGIN_URL, method="POST", headers=headers,
             cookies=cookies, data=data)

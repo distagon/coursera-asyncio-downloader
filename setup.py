@@ -15,8 +15,8 @@ def read(*names, **kwargs):
     ).read().strip()
 
 
-install_requires=read('requirements.txt').split('\n')
-if not sys.version_info >= (3,4):
+install_requires = read('requirements.txt').split('\n')
+if not sys.version_info >= (3, 4):
     install_requires.append('asyncio')
 
 
@@ -35,5 +35,5 @@ setup(
     packages=find_packages(exclude='tests'),
     test_suite='unittest2.collector',
     tests_require=['unittest2'],
-    include_package_data = True,
+    include_package_data=True,
 )
