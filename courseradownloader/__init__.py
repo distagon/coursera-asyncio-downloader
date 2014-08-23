@@ -1,3 +1,3 @@
-from .casyncio import Downloader
+from .casyncio import Downloader, logger
 
-all = ['Downloader']
+all = ['Downloader', 'logger']

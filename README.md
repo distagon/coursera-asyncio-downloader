@@ -1,4 +1,4 @@
-courseradownloader
+coursera-asyncio-downloader
 ====================================
 
 Asyncio downloader for coursera lectures.
@@ -20,8 +20,12 @@ Install
     cd courseradownloder
     python3 setup.py install
 
+    or
+
+    pip3 install . --user
+
 
 Using
 ------------------------------------
 
-    courseradownloder.py --help
+    cdownloder.py --help

@@ -1,4 +1,6 @@
+import time
 import os
+import sys
 import argparse
 import asyncio
 import logging
@@ -6,6 +8,7 @@ import urllib.parse
 from aiohttp import request, EofStream
 from colorama import init as colorama_init, Fore
 from pyquery import PyQuery as pq
+from collections import namedtuple
 
 
 logging.basicConfig()
@@ -13,8 +16,25 @@ logger = logging.getLogger('coursera')
 logger.setLevel(logging.INFO)
 
 
-def _print_color(text, color):
-    print("{}{}{}".format(color, text, Fore.RESET))
+ProcessMessage = namedtuple('ProcessMessage', 'size')
+SkippedMessage = namedtuple('SkippedMessage', 'filename')
+FinishedMessage = namedtuple('FinishedMessage', 'filename size')
+DoneMessage = namedtuple('DoneMessage', 'size')
+
+
+def _print_color_line(text, color, same_line=False, last_string_length=[0]):
+    message = '{}{}{}'.format(color, text, Fore.RESET)
+    message_length = len(text)
+    if not same_line:
+        print(message)
+        return
+    spaces = 0
+    if last_string_length[0] > message_length:
+        spaces = last_string_length[0] - message_length
+    last_string_length[0] = message_length + spaces
+    message = '{}{}{}'.format(message, ' ' * spaces, '\b' * len(text))
+    sys.stdout.write(message)
+    sys.stdout.flush()
 
 
 def request_to_str(request):
@@ -23,9 +43,48 @@ def request_to_str(request):
 
 
 @asyncio.coroutine
-def _http_request(url, method="GET", headers=None, cookies=None, **kwargs):
+def _http_request(url, method='GET', headers=None, cookies=None, **kwargs):
     return (yield from request(
         method, url, headers=headers, cookies=cookies, **kwargs))
+
+
+def prepare_downloader_info():
+
+    @asyncio.coroutine
+    def downloader_info():
+        current_size = 0
+        number_of_finished_files = 0
+        message_str = '[{}/{}][{}KB/s]'
+        done = False
+        number_of_files = (yield)
+        start_time = time.time()
+        while not done:
+            message = (yield)
+            elapsed_time = time.time() - start_time
+            if isinstance(message, ProcessMessage):
+                current_size += message.size
+            elif isinstance(message, FinishedMessage):
+                number_of_finished_files += 1
+                message_text = 'Finished: {}. Size {}KB'.format(
+                    message.filename,
+                    '{:0.2f}'.format(message.size / 1024.0))
+                _print_color_line(message_text, Fore.GREEN)
+            elif isinstance(message, SkippedMessage):
+                _print_color_line(
+                    'Skipped: {}'.format(message.filename), Fore.RED)
+            elif isinstance(message, DoneMessage):
+                current_size += message.size
+            if elapsed_time >= 1:
+                speed = '{:0.2f}'.format(current_size / elapsed_time / 1024.0)
+                message = message_str.format(
+                    number_of_finished_files, number_of_files, speed)
+                _print_color_line(message, Fore.RED, same_line=True)
+                start_time = time.time()
+                current_size = 0
+
+    info_coroutine = downloader_info()
+    next(info_coroutine)
+    return info_coroutine
 
 
 class CourseraParser:
@@ -38,7 +97,7 @@ class CourseraParser:
         self.page = page
 
     def parse_page(self):
-        logger.info("Getting files list...")
+        _print_color_line("Getting files list...", Fore.RED)
         root_elements = pq(self.page)(self.ROOT_ELEMENT)
         return [self._parse_element(el) for el in root_elements]
 
@@ -57,20 +116,25 @@ class CourseraParser:
 
 class FileDownloader:
 
-    def __init__(self, directory, url, sem, headers=None, cookies=None):
+    def __init__(self, directory, url, info_coroutine,
+                 sem, headers=None, cookies=None):
         self.directory = directory
         self.url = url
         self.cookies = cookies
         self.headers = headers
         self.fl = None
         self.sem = sem
+        self.info_coroutine = info_coroutine
 
     @staticmethod
     def check_filename(filename, content_length=None):
-        return (
-            not os.path.exists(filename) or
-            content_length is None or not content_length.isdigit() or
-            os.path.getsize(filename) != int(content_length))
+        if not os.path.exists(filename):
+            return True
+        if content_length is None:
+            return False
+        if not content_length.isdigit():
+            return True
+        return os.path.getsize(filename) != int(content_length)
 
     @asyncio.coroutine
     def _get_file_data(self):
@@ -117,24 +181,24 @@ class FileDownloader:
             if result is None or result[0] is None:
                 logger.error(
                     "Cannot get filename from url {}. Passed".format(self.url))
-                return 0
+                return
             filename, content_length = result
             filename_path = os.path.normpath(os.path.abspath(
                 os.path.join(self.directory, filename)))
             if not self.check_filename(filename_path, content_length):
-                _print_color("Skipped: {}".format(filename), Fore.RED)
-                return 0
+                self.info_coroutine.send(SkippedMessage(filename))
+                return
+            self.filename = filename
             self.fl = self._open_file(filename_path)
             bytes = yield from self._download_file()
             if bytes:
-                _print_color(
-                    "Finished: {}. Size {} bytes".format(filename, bytes),
-                    Fore.GREEN)
+                self.info_coroutine.send(FinishedMessage(filename, bytes))
 
     @asyncio.coroutine
     def _download_file(self):
         size = 0
         response = None
+        buf = 2048
         try:
             response = yield from _http_request(
                 self.url, method='GET', headers=self.headers,
@@ -142,14 +206,20 @@ class FileDownloader:
             if response.status >= 400:
                 logger.error(request_to_str(response))
                 return
+            current_size = 0
             try:
                 while True:
-                    chunk = yield from response.content.read()
-                    if chunk.strip() == b'':
-                        continue
-                    size += yield from self._write_to_file(chunk)
+                    chunk = yield from response.content.read(buf)
+                    if not chunk:
+                        break
+                    #current_size = yield from self._write_to_file(chunk)
+                    current_size = self.fl.write(chunk)
+                    self.info_coroutine.send(ProcessMessage(current_size))
+                    size += current_size
+                self.info_coroutine.send(ProcessMessage(current_size))
                 return size
             except EofStream:
+                self.info_coroutine.send(ProcessMessage(current_size))
                 return size
         except KeyboardInterrupt:
             pass
@@ -162,10 +232,6 @@ class FileDownloader:
 
     def _open_file(self, filename):
         return open(filename, 'wb')
-
-    @asyncio.coroutine
-    def _write_to_file(self, chunk):
-        return self.fl.write(chunk)
 
 
 class Downloader:
@@ -183,15 +249,16 @@ class Downloader:
         "type=login&subtype=normal")
     REQUESTS_HEADERS = {"Accept": "*/*", "User-Agent": "coursera-client"}
 
-    def __init__(self, class_name, username,
+    def __init__(self, classname, username,
                  password, concurrency, directory, chapter=None):
-        self.class_name = class_name
+        self.class_name = classname
         self.username = username
         self.password = password
         self.chapter = chapter
         self.concurrency = concurrency
         self.directory = directory
         self.auth_cookies = None
+        self.info_coroutine = prepare_downloader_info()
 
     @asyncio.coroutine
     def _get_csrf_token(self):
@@ -225,7 +292,7 @@ class Downloader:
 
     @asyncio.coroutine
     def _get_session_cookies(self):
-        logger.info("Authenticating...")
+        _print_color_line("Authenticating...", Fore.RED)
         yield from self._get_auth_cookies()
         if self.auth_cookies is None:
             return
@@ -262,23 +329,25 @@ class Downloader:
         if self.chapter is not None:
             result = result[self.chapter - 1:]
         if not result:
-            logger.info("Nothing to download")
+            logger.info("There is nothing to download")
             return
         colorama_init()
         number_of_files = sum([len(res[1]) for res in result])
-        _print_color(
-            "Starting to download {} files".format(number_of_files), Fore.RED)
+        _print_color_line(
+            "Starting to download {} files".
+            format(number_of_files), Fore.GREEN)
         sem = asyncio.Semaphore(self.concurrency)
         downloaders = []
         cookies = {self.AUTH_COOKIE_NAME: self.auth_cookies}
+        self.info_coroutine.send(number_of_files)
         for name, links in result:
             directory = os.path.join(self.directory, name)
             if not os.path.exists(directory):
                 os.mkdir(directory)
             for link in links:
                 downloader = FileDownloader(
-                    directory, link, headers=self.REQUESTS_HEADERS,
-                    cookies=cookies, sem=sem)
+                    directory, link, self.info_coroutine,
+                    headers=self.REQUESTS_HEADERS, cookies=cookies, sem=sem)
                 downloaders.append(downloader.start())
         return (yield from asyncio.wait(downloaders))
 
@@ -288,5 +357,9 @@ class Downloader:
         try:
             loop.run_until_complete(future)
         except KeyboardInterrupt:
+            pass
+        try:
+            self.info_coroutine.send(DoneMessage(0))
+        except StopIteration:
             pass
         loop.close()
