@@ -102,7 +102,7 @@ def prepare_parser():
         "--name",
         required=False,
         action="store",
-        dest="name",
+        dest="classname",
         type=str,
         help="Coursera class name")
 

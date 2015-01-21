@@ -240,8 +240,8 @@ class Downloader:
     CSRF_TOKEN_COOKIE_NAME = "csrf_token"
     PASSWORD_FIELD_NAME = "password"
     USERNAME_FIELD_NAME = "email"
-    LECTURE_URL = "https://class.coursera.org/{}/lecture/index"
-    LECTURE_CSRF_URL = "https://class.coursera.org/{}/lecture"
+    LECTURE_CSRF_URL = "https://class.coursera.org/{}"
+    LECTURE_URL = "https://class.coursera.org/{}/lecture"
     LOGIN_URL = "https://accounts.coursera.org/api/v1/login"
     REFERRER_URL = "https://accounts.coursera.org/signin"
     CLASS_AUTH_URL = (
