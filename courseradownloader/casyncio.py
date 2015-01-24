@@ -3,6 +3,7 @@ import os
 import sys
 import argparse
 import asyncio
+import posixpath
 import logging
 import urllib.parse
 from aiohttp import request, EofStream
@@ -20,19 +21,23 @@ ProcessMessage = namedtuple('ProcessMessage', 'size')
 SkippedMessage = namedtuple('SkippedMessage', 'filename')
 FinishedMessage = namedtuple('FinishedMessage', 'filename size')
 DoneMessage = namedtuple('DoneMessage', 'size')
+WheelMessage = namedtuple('WheelMessage', 'shape')
+InitialMessage = namedtuple('InitialMessage', 'number')
+FILE_SIZES = ('', 'KB', 'MB', 'GB')
 
 
 def _print_color_line(text, color, same_line=False, last_string_length=[0]):
     message = '{}{}{}'.format(color, text, Fore.RESET)
-    message_length = len(text)
     if not same_line:
         print(message)
         return
+    message_length = len(message)
     spaces = 0
     if last_string_length[0] > message_length:
         spaces = last_string_length[0] - message_length
     last_string_length[0] = message_length + spaces
-    message = '{}{}{}'.format(message, ' ' * spaces, '\b' * len(text))
+    message = '{}{}{}'.format(
+        message, ' ' * spaces, '\b' * (len(text) + spaces))
     sys.stdout.write(message)
     sys.stdout.flush()
 
@@ -42,10 +47,27 @@ def request_to_str(request):
         request.host, request.url, request.status, request.reason))
 
 
+def format_size(size):
+    index = 0
+    while size > 1024 and index < len(FILE_SIZES) - 1:
+        size /= 1024.0
+        index += 1
+    return size, FILE_SIZES[index]
+
+
 @asyncio.coroutine
 def _http_request(url, method='GET', headers=None, cookies=None, **kwargs):
-    return (yield from request(
-        method, url, headers=headers, cookies=cookies, **kwargs))
+    result = yield from request(
+        method, url, headers=headers, cookies=cookies, **kwargs)
+    return result
+
+
+def send_message(coroutine, klass, *messages):
+    if coroutine is not None:
+        try:
+            coroutine.send(klass(*messages))
+        except StopIteration:
+            pass
 
 
 def prepare_downloader_info():
@@ -53,34 +75,50 @@ def prepare_downloader_info():
     @asyncio.coroutine
     def downloader_info():
         current_size = 0
+        wheel_pos_changed = False
+        wheel_current_pos = '-'
         number_of_finished_files = 0
-        message_str = '[{}/{}][{}KB/s]'
+        message_str = '[{0}][{1}/{2}][{3:0.2f}{4}/s]'
         done = False
-        number_of_files = (yield)
+        while True:
+            initial_message = (yield)
+            if isinstance(initial_message, InitialMessage):
+                number_of_files = initial_message.number
+                break
         start_time = time.time()
         while not done:
             message = (yield)
-            elapsed_time = time.time() - start_time
             if isinstance(message, ProcessMessage):
                 current_size += message.size
+            elif isinstance(message, WheelMessage):
+                wheel_current_pos = message.shape
+                wheel_pos_changed = True
             elif isinstance(message, FinishedMessage):
                 number_of_finished_files += 1
-                message_text = 'Finished: {}. Size {}KB'.format(
-                    message.filename,
-                    '{:0.2f}'.format(message.size / 1024.0))
+                size, quantify = format_size(message.size)
+                message_text = 'Finished: {}. Size {:0.2f}{}'.format(
+                    message.filename, size, quantify)
                 _print_color_line(message_text, Fore.GREEN)
             elif isinstance(message, SkippedMessage):
+                number_of_finished_files += 1
                 _print_color_line(
                     'Skipped: {}'.format(message.filename), Fore.RED)
             elif isinstance(message, DoneMessage):
                 current_size += message.size
-            if elapsed_time >= 1:
-                speed = '{:0.2f}'.format(current_size / elapsed_time / 1024.0)
-                message = message_str.format(
-                    number_of_finished_files, number_of_files, speed)
-                _print_color_line(message, Fore.RED, same_line=True)
-                start_time = time.time()
-                current_size = 0
+                done = True
+            elapsed_time = time.time() - start_time
+            if wheel_pos_changed or elapsed_time >= 2 or done:
+                speed, quantify = format_size(
+                    current_size / float(elapsed_time))
+                message_text = message_str.format(
+                    wheel_current_pos, number_of_finished_files,
+                    number_of_files, speed, quantify)
+                _print_color_line(message_text, Fore.RED, same_line=True)
+                if elapsed_time >= 2:
+                    start_time = time.time()
+                    current_size = 0
+                if wheel_pos_changed:
+                    wheel_pos_changed = False
 
     info_coroutine = downloader_info()
     next(info_coroutine)
@@ -171,7 +209,11 @@ class FileDownloader:
                 content_disposition.split(";")[1].strip().
                 split("=")[-1]).strip("\"\'")
         else:
-            filename = None
+            if self.url.endswith('/'):
+                # non file
+                return
+            path = urllib.parse.urlsplit(self.url)
+            filename = posixpath.basename(path)
         return filename, content_length
 
     @asyncio.coroutine
@@ -180,19 +222,26 @@ class FileDownloader:
             result = yield from self._get_file_name()
             if result is None or result[0] is None:
                 logger.error(
-                    "Cannot get filename from url {}. Passed".format(self.url))
+                    "Cannot get filename from url {}. Skipped".
+                    format(self.url))
                 return
             filename, content_length = result
             filename_path = os.path.normpath(os.path.abspath(
                 os.path.join(self.directory, filename)))
             if not self.check_filename(filename_path, content_length):
-                self.info_coroutine.send(SkippedMessage(filename))
+                send_message(self.info_coroutine, SkippedMessage, filename)
                 return
             self.filename = filename
-            self.fl = self._open_file(filename_path)
+            try:
+                self.fl = yield from self._open_file(filename_path)
+            except OSError as err:
+                logger.error(
+                    "Cannot open file: {0}. {1}".format(filename_path, err))
+                return
             bytes = yield from self._download_file()
             if bytes:
-                self.info_coroutine.send(FinishedMessage(filename, bytes))
+                send_message(
+                    self.info_coroutine, FinishedMessage, filename, bytes)
 
     @asyncio.coroutine
     def _download_file(self):
@@ -212,14 +261,14 @@ class FileDownloader:
                     chunk = yield from response.content.read(buf)
                     if not chunk:
                         break
-                    #current_size = yield from self._write_to_file(chunk)
-                    current_size = self.fl.write(chunk)
-                    self.info_coroutine.send(ProcessMessage(current_size))
+                    current_size = yield from self._write_to_file(chunk)
+                    send_message(
+                        self.info_coroutine, ProcessMessage, current_size)
                     size += current_size
-                self.info_coroutine.send(ProcessMessage(current_size))
+                send_message(self.info_coroutine, ProcessMessage, current_size)
                 return size
             except EofStream:
-                self.info_coroutine.send(ProcessMessage(current_size))
+                send_message(self.info_coroutine, ProcessMessage, current_size)
                 return size
         except KeyboardInterrupt:
             pass
@@ -230,6 +279,11 @@ class FileDownloader:
                 response.close()
             self.fl.close()
 
+    @asyncio.coroutine
+    def _write_to_file(self, chunk):
+        return self.fl.write(chunk)
+
+    @asyncio.coroutine
     def _open_file(self, filename):
         return open(filename, 'wb')
 
@@ -339,7 +393,7 @@ class Downloader:
         sem = asyncio.Semaphore(self.concurrency)
         downloaders = []
         cookies = {self.AUTH_COOKIE_NAME: self.auth_cookies}
-        self.info_coroutine.send(number_of_files)
+        send_message(self.info_coroutine, InitialMessage, number_of_files)
         for name, links in result:
             directory = os.path.join(self.directory, name)
             if not os.path.exists(directory):
@@ -351,7 +405,20 @@ class Downloader:
                 downloaders.append(downloader.start())
         return (yield from asyncio.wait(downloaders))
 
+    @asyncio.coroutine
+    def wheel(self, delay):
+        wheel_pos = ('-', '\\', '|', '/')
+        counter = 0
+        while True:
+            yield from asyncio.sleep(delay)
+            pos = wheel_pos[counter % len(wheel_pos)]
+            send_message(self.info_coroutine, WheelMessage, pos)
+            next_counter = counter + 1
+            counter = (0 if next_counter % len(wheel_pos) == 0
+                       else next_counter)
+
     def start(self):
+        wheel_task = asyncio.Task(self.wheel(0.5))
         loop = asyncio.get_event_loop()
         future = self.prepare()
         try:
@@ -359,7 +426,8 @@ class Downloader:
         except KeyboardInterrupt:
             pass
         try:
-            self.info_coroutine.send(DoneMessage(0))
+            wheel_task.cancel()
+            send_message(self.info_coroutine, DoneMessage, 0)
         except StopIteration:
             pass
         loop.close()

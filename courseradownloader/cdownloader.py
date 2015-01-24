@@ -58,14 +58,16 @@ def read_configs(*args):
     return result
 
 
+def check_absent_options(options, names):
+    return [name for name in names if not options.get(name)]
+
+
 def check_options(options):
-    absent_options = []
-    if not options.get("classname"):
-        absent_options.append("classname")
-    if not options.get("username"):
-        absent_options.append("username")
-    if not options.get("password"):
-        absent_options.append("password")
+    absent_options = check_absent_options(options, [
+        "classname",
+        "username",
+        "password",
+    ])
     if absent_options:
         print(
             "Absent parameters: %s.\nYou should set them either in the"
